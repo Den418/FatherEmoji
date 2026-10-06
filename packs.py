@@ -4,16 +4,23 @@ import logging
 import os
 import shutil
 import time
+import uuid
 
 from hydrogram import enums
 from hydrogram.types import Message
 
 import db
+import jobs
 import keyboards
 import media
+import recolor
+import re
 import states
+import textemoji
 import texts as T
-from tg import bot_suffix, get_custom_emoji_info, h, pack_link, tg_api, tg_api_retry
+import vector
+from tg import (JobCancelled, bot_suffix, download_file, get_custom_emoji_info, h, pack_link,
+                tg_api, tg_api_retry)
 
 log = logging.getLogger("fatheremoji")
 
@@ -23,30 +30,111 @@ def progress_bar(done: int, total: int, width: int = 12) -> str:
     return "▓" * filled + "░" * (width - filled)
 
 
-async def _upload_sticker(uid: int, link: str, sticker_obj: dict, out_path: str,
-                          upload_name: str, mime_type: str, pack_title: str) -> dict:
-    """addStickerToSet с автосозданием пака, если его ещё нет у Telegram."""
-    files = {"f": (upload_name, open(out_path, "rb"), mime_type)}
-    res = await tg_api(
+def friendly_error(desc: str) -> str:
+    """Ошибка Bot API простыми словами."""
+    d = (desc or "").lower()
+    if "too much" in d or "stickers_too_much" in d:
+        return T.ERR_PACK_FULL
+    if "retry after" in d or "too many requests" in d:
+        return T.ERR_FLOOD
+    if "too big" in d or "_big" in d:
+        return T.ERR_TOO_BIG
+    if "dimensions" in d:
+        return T.ERR_DIMENSIONS
+    if "format" in d or "invalid_sticker" in d or "wrong file" in d:
+        return T.ERR_FORMAT
+    return h(desc) if desc else T.ERR_UNKNOWN
+
+
+def _is_full(desc: str) -> bool:
+    d = (desc or "").lower()
+    return "too much" in d or "stickers_too_much" in d
+
+
+async def add_to_pack(uid: int, link: str, title: str, sticker_obj: dict,
+                      path: str | None = None, name: str = "", mime: str = "") -> dict:
+    """
+    addStickerToSet; если пака ещё нет, создаёт его (createNewStickerSet) с этим эмодзи.
+    path: файл для загрузки (sticker_obj["sticker"] тогда "attach://f"), иначе file_id.
+    """
+    spec = ("f", path, name, mime) if path else None
+    res = await tg_api_retry(
         "addStickerToSet",
-        data={"user_id": uid, "name": link, "sticker": json.dumps(sticker_obj)},
-        files=files,
+        {"user_id": uid, "name": link, "sticker": json.dumps(sticker_obj)},
+        max_attempts=8,
+        file_spec=spec,
     )
     if not res.get("ok") and "STICKERSET_INVALID" in res.get("description", ""):
-        res = await tg_api(
+        res = await tg_api_retry(
             "createNewStickerSet",
-            data={
-                "user_id": uid,
-                "name": link,
-                "title": pack_title,
-                "sticker_type": "custom_emoji",
-                "stickers": json.dumps([sticker_obj]),
-            },
-            files={"f": (upload_name, open(out_path, "rb"), mime_type)},
+            {"user_id": uid, "name": link, "title": title[:64], "sticker_type": "custom_emoji",
+             "stickers": json.dumps([sticker_obj])},
+            max_attempts=8,
+            file_spec=spec,
         )
         if res.get("ok"):
-            db.db_add_pack(uid, link, pack_title)
+            db.db_add_pack(uid, link, title)
     return res
+
+
+async def dest_format(link: str) -> str | None:
+    """Формат уже существующего пака (static/animated/video) или None, если пак пуст или его нет."""
+    res = await tg_api("getStickerSet", data={"name": link})
+    if not res.get("ok"):
+        return None
+    stickers = res["result"].get("stickers", [])
+    if not stickers:
+        return None
+    s = stickers[0]
+    return "video" if s.get("is_video") else "animated" if s.get("is_animated") else "static"
+
+
+async def transplant(uid: int, link: str, title: str, file_id: str, src_fmt: str,
+                     emoji: str, st: dict) -> tuple[bool, str, str]:
+    """
+    Кладёт чужой стикер или эмодзи в пак. Сначала самый быстрый путь (по file_id),
+    а если Telegram отказал (тяжёлый файл, размер 512 вместо 100, чужой формат),
+    файл скачивается, сжимается или конвертируется под формат пака и грузится заново.
+
+    st["target"]: формат пака. Обновляется после первого успеха.
+    Возвращает (успех, пометка, ошибка). Пометка: "" | "converted" | "frame".
+    """
+    target = st.get("target")
+    if target in (None, src_fmt):
+        obj = {"sticker": file_id, "format": src_fmt, "emoji_list": [emoji]}
+        res = await add_to_pack(uid, link, title, obj)
+        if res.get("ok"):
+            st["target"] = target or src_fmt
+            return True, "", ""
+        desc = res.get("description", "")
+        if _is_full(desc):
+            return False, "", friendly_error(desc)
+
+    tmp = f"temp/{uid}_{uuid.uuid4().hex[:8]}"
+    os.makedirs(tmp, exist_ok=True)
+    try:
+        raw = os.path.join(tmp, "raw")
+        if not await download_file(file_id, raw):
+            return False, "", T.ERR_DOWNLOAD
+        kind = await asyncio.to_thread(media.detect_type, raw)
+        if kind == "empty":
+            return False, "", T.ERR_DOWNLOAD
+        try:
+            out, fmt, mime, name, note = await media.adapt(raw, kind, target, tmp)
+        except media.AdaptError as e:
+            return False, "", T.ADAPT_ERRORS.get(e.reason, T.ERR_UNKNOWN)
+        except Exception as e:
+            log.error(f"adapt error: {e}", exc_info=True)
+            return False, "", T.ERR_UNKNOWN
+
+        obj = {"sticker": "attach://f", "format": fmt, "emoji_list": [emoji]}
+        res = await add_to_pack(uid, link, title, obj, path=out, name=name, mime=mime)
+        if res.get("ok"):
+            st["target"] = target or fmt
+            return True, (note or "converted"), ""
+        return False, "", friendly_error(res.get("description", ""))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 async def _last_custom_emoji_id(link: str) -> str | None:
@@ -63,10 +151,10 @@ async def _last_custom_emoji_id(link: str) -> str | None:
 
 async def process_media(client, message: Message, uid: int, force_vector: bool | None = None):
     """
-    force_vector=None — берём режим векторизации из состояния пользователя
+    force_vector=None - берём режим векторизации из состояния пользователя
     ("off"/"on"/"ask"); в режиме "ask" картинка сначала предъявляется
     пользователю с кнопками «вектором / обычной».
-    force_vector=True/False — явное решение (после ответа на вопрос).
+    force_vector=True/False - явное решение (после ответа на вопрос).
     """
     data = states.user_states.get(uid, {})
     link = data.get("link")
@@ -92,7 +180,7 @@ async def process_media(client, message: Message, uid: int, force_vector: bool |
 
         # Режим «спрашивать»: картинку откладываем и уточняем у пользователя
         if ask_now and file_type == "image":
-            data["next_emoji"] = emoji   # вернём реакцию на место — возьмём после ответа
+            data["next_emoji"] = emoji   # вернём реакцию на место - возьмём после ответа
             data["ask_msg"] = message
             await msg.edit_text(
                 T.ASK_IMAGE,
@@ -103,35 +191,27 @@ async def process_media(client, message: Message, uid: int, force_vector: bool |
 
         if file_type == "tgs":
             out_path = f"{tmp}/ready.tgs"
-            os.rename(raw_path, out_path)
+            if os.path.getsize(raw_path) > media.TGS_LIMIT:
+                try:
+                    await media.shrink_tgs(raw_path, out_path)
+                except media.ImageTooComplex:
+                    return await msg.edit_text(T.TGS_TOO_HEAVY, parse_mode=enums.ParseMode.HTML)
+            else:
+                os.rename(raw_path, out_path)
             fmt = "animated"
             mime_type = "application/x-tgsticker"
             upload_name = "ready.tgs"
 
         elif file_type in ("webm", "video"):
             # В векторном режиме видео не принимается вовсе: в один пак нельзя
-            # смешивать форматы, а вектор — это animated.
+            # смешивать форматы, а вектор - это animated.
             if vector_mode == "on":
                 return await msg.edit_text(T.VECT_ONLY_IMAGES)
 
             out_path = f"{tmp}/ready.webm"
-            # mp4/gif/avi физически не несут альфа-канал — сразу кодируем без него
-            # (легче для битрейта); настоящий webm может быть прозрачным, поэтому
-            # для него до последнего пытаемся альфу сохранить.
-            no_alpha = (file_type == "video")
-
-            ok = await media.convert_to_webm(raw_path, out_path, no_alpha=no_alpha)
-            if not ok:
-                ok = await media.convert_to_webm(raw_path, out_path, fallback_bitrate=True, no_alpha=no_alpha)
-            if not ok:
-                ok = await media.convert_to_webm(raw_path, out_path, fallback_bitrate=True, no_alpha=no_alpha, max_duration=1.5)
-            if not ok and not no_alpha:
-                # Последний шанс для webm с настоящей прозрачностью: жертвуем альфой,
-                # чтобы файл гарантированно доехал, а не отваливался по размеру.
-                ok = await media.convert_to_webm(
-                    raw_path, out_path, fallback_bitrate=True, no_alpha=no_alpha,
-                    max_duration=1.5, force_drop_alpha=True,
-                )
+            # mp4/gif/avi физически не несут альфа-канал; настоящий webm может быть
+            # прозрачным, поэтому для него до последнего пытаемся альфу сохранить.
+            ok = await media.compress_video(raw_path, out_path, no_alpha=(file_type == "video"))
             if not ok:
                 return await msg.edit_text(T.MEDIA_TOO_HEAVY)
             fmt = "video"
@@ -162,8 +242,8 @@ async def process_media(client, message: Message, uid: int, force_vector: bool |
                 upload_name = "ready.webp"
 
         sticker_obj = {"sticker": "attach://f", "format": fmt, "emoji_list": [emoji]}
-        res = await _upload_sticker(uid, link, sticker_obj, out_path,
-                                    upload_name, mime_type, data.get("title", "My Emoji Pack"))
+        res = await add_to_pack(uid, link, data.get("title", "My Emoji Pack"), sticker_obj,
+                                path=out_path, name=upload_name, mime=mime_type)
 
         if not res.get("ok"):
             desc = res.get("description", "")
@@ -185,7 +265,7 @@ async def process_media(client, message: Message, uid: int, force_vector: bool |
             elif "wrong file type" in desc.lower() or "invalid" in desc.lower():
                 friendly = T.TG_BAD_FORMAT
             else:
-                friendly = T.TG_ERROR.format(desc=h(desc))
+                friendly = T.TG_ERROR.format(desc=friendly_error(desc))
             await msg.edit_text(friendly, parse_mode=enums.ParseMode.HTML)
 
     except Exception as e:
@@ -204,63 +284,51 @@ async def add_custom_emojis(client, message: Message, uid: int, ce_entities: lis
     link = data.get("link")
     if not link:
         return await message.reply(T.NO_ACTIVE_SHORT, parse_mode=enums.ParseMode.HTML)
+    if jobs.busy(uid):
+        return await message.reply(T.JOB_BUSY)
 
     default_emoji = data.get("default_emoji", "✨")
-    added = 0
+    title = data.get("title", "My Emoji Pack")
+    st = {"target": await dest_format(link)}
+    converted = 0
     errors = []
+    total = len(ce_entities)
 
-    msg = await message.reply(T.COPYING_EMOJIS.format(n=len(ce_entities)))
+    msg = await message.reply(T.COPYING_EMOJIS.format(n=total))
+    job = jobs.Job(uid, msg, total, head=T.COPYING_EMOJIS.format(n=total))
+    stopped = False
 
-    for idx, ent in enumerate(ce_entities):
-        info = await get_custom_emoji_info(client, ent.custom_emoji_id)
-        if not info:
-            errors.append(T.HIDDEN_EMOJI.format(n=idx + 1))
-            continue
+    async with jobs.running(job):
+        for idx, ent in enumerate(ce_entities):
+            if job.cancel:
+                stopped = True
+                break
+            t0, f0 = time.monotonic(), job.flood_time
+            ok = False
+            try:
+                info = await get_custom_emoji_info(client, ent.custom_emoji_id)
+                if not info:
+                    errors.append(T.HIDDEN_EMOJI.format(n=idx + 1))
+                else:
+                    ok, note, err = await transplant(uid, link, title, info["file_id"], info["format"],
+                                                     default_emoji, st)
+                    if ok:
+                        converted += 1 if note else 0
+                    else:
+                        errors.append(T.COPY_ONE_ERR.format(n=idx + 1, desc=err))
+            except JobCancelled:
+                stopped = True
+                break
+            job.record((time.monotonic() - t0) - (job.flood_time - f0), ok)
+            await job.update()
 
-        sticker_obj = {
-            "sticker": info["file_id"],
-            "format": info["format"],
-            "emoji_list": [default_emoji],
-        }
-
-        res = await tg_api_retry(
-            "addStickerToSet",
-            data={"user_id": uid, "name": link, "sticker": json.dumps(sticker_obj)},
-        )
-
-        if not res.get("ok"):
-            desc = res.get("description", "")
-            if "STICKERSET_INVALID" in desc:
-                res = await tg_api_retry(
-                    "createNewStickerSet",
-                    data={
-                        "user_id": uid,
-                        "name": link,
-                        "title": data.get("title", "My Emoji Pack"),
-                        "sticker_type": "custom_emoji",
-                        "stickers": json.dumps([sticker_obj]),
-                    },
-                )
-                if res.get("ok"):
-                    db.db_add_pack(uid, link, data.get("title", "My Emoji Pack"))
-            elif "format" in desc.lower() or "invalid_sticker" in desc.lower():
-                errors.append(T.COPY_FMT_ERR.format(n=idx + 1))
-            else:
-                errors.append(T.COPY_ONE_ERR.format(n=idx + 1, desc=h(desc)))
-
-        if res.get("ok"):
-            added += 1
-
-    lines = [T.COPY_RESULT.format(added=added, total=len(ce_entities))]
+    lines = [(T.CLONE_STOPPED if stopped else T.COPY_RESULT).format(added=job.added, total=total)]
+    if converted:
+        lines.append(T.COPY_CONVERTED.format(n=converted))
     if errors:
         lines.append("\n<blockquote expandable>" + T.COPY_ERRORS + "\n" + "\n".join(errors) + "</blockquote>")
     lines.append(f"\n{pack_link(link)}")
-
-    await msg.edit_text(
-        "\n".join(lines),
-        disable_web_page_preview=True,
-        parse_mode=enums.ParseMode.HTML,
-    )
+    await job.finish("\n".join(lines))
 
 
 # ════════════════════════════════════════════════════════════════
@@ -272,6 +340,8 @@ async def copy_entire_pack(client, message: Message, uid: int, source_pack: str)
     link = data.get("link")
     if not link:
         return await message.reply(T.NO_ACTIVE_PACK, parse_mode=enums.ParseMode.HTML)
+    if jobs.busy(uid):
+        return await message.reply(T.JOB_BUSY)
 
     res = await tg_api("getStickerSet", data={"name": source_pack})
     if not res.get("ok"):
@@ -281,66 +351,45 @@ async def copy_entire_pack(client, message: Message, uid: int, source_pack: str)
     if not stickers:
         return await message.reply(T.CLONE_EMPTY, parse_mode=enums.ParseMode.HTML)
 
+    title = data.get("title", "My Emoji Pack")
+    st = {"target": await dest_format(link)}
     total = len(stickers)
     msg = await message.reply(f"{T.CLONING}\n\n⏳ 0 / {total}", parse_mode=enums.ParseMode.HTML)
-    added = 0
+    job = jobs.Job(uid, msg, total, head=T.CLONING)
+    converted = 0
     errors = []
+    stopped = False
 
-    for idx, s in enumerate(stickers):
-        fmt = "video" if s.get("is_video") else "animated" if s.get("is_animated") else "static"
-        sticker_obj = {"sticker": s["file_id"], "format": fmt, "emoji_list": [s.get("emoji", "✨")]}
-
-        add_res = await tg_api_retry(
-            "addStickerToSet",
-            data={"user_id": uid, "name": link, "sticker": json.dumps(sticker_obj)},
-        )
-
-        if not add_res.get("ok"):
-            desc = add_res.get("description", "")
-            if "STICKERSET_INVALID" in desc:
-                add_res = await tg_api_retry(
-                    "createNewStickerSet",
-                    data={
-                        "user_id": uid,
-                        "name": link,
-                        "title": data.get("title", "My Emoji Pack"),
-                        "sticker_type": "custom_emoji",
-                        "stickers": json.dumps([sticker_obj]),
-                    },
-                )
-                if add_res.get("ok"):
-                    db.db_add_pack(uid, link, data.get("title", "My Emoji Pack"))
-
-            if not add_res.get("ok"):
-                desc = add_res.get("description", "")
-                if "format" in desc.lower():
-                    errors.append(f"#{idx + 1} — конфликт форматов")
-                else:
-                    errors.append(f"#{idx + 1} — {desc}")
-            else:
-                added += 1
-        else:
-            added += 1
-
-        if (idx + 1) % 5 == 0 or (idx + 1) == total:
-            bar = progress_bar(idx + 1, total)
+    async with jobs.running(job):
+        for idx, s in enumerate(stickers):
+            if job.cancel:
+                stopped = True
+                break
+            fmt = "video" if s.get("is_video") else "animated" if s.get("is_animated") else "static"
+            t0, f0 = time.monotonic(), job.flood_time
             try:
-                await msg.edit_text(f"{T.CLONING}\n\n[{bar}] {idx + 1} / {total}")
-            except Exception:
-                pass
+                ok, note, err = await transplant(uid, link, title, s["file_id"], fmt, s.get("emoji", "✨"), st)
+            except JobCancelled:
+                stopped = True
+                break
+            if ok:
+                converted += 1 if note else 0
+            else:
+                errors.append(f"#{idx + 1}: {err}")
+            job.record((time.monotonic() - t0) - (job.flood_time - f0), ok)
+            if not ok and err == T.ERR_PACK_FULL:
+                break
+            await job.update()
 
-    lines = [T.CLONE_RESULT.format(added=added, total=total)]
+    lines = [(T.CLONE_STOPPED if stopped else T.CLONE_RESULT).format(added=job.added, total=total)]
+    if converted:
+        lines.append(T.COPY_CONVERTED.format(n=converted))
     if errors:
-        shown = errors[:5]
-        tail = ("\n" + T.CLONE_MORE.format(n=len(errors) - 5)) if len(errors) > 5 else ""
+        shown = errors[:6]
+        tail = ("\n" + T.CLONE_MORE.format(n=len(errors) - 6)) if len(errors) > 6 else ""
         lines.append("\n<blockquote expandable>" + T.CLONE_ERRORS + "\n" + "\n".join(shown) + tail + "</blockquote>")
     lines.append(f"\n{pack_link(link)}")
-
-    await msg.edit_text(
-        "\n".join(lines),
-        disable_web_page_preview=True,
-        parse_mode=enums.ParseMode.HTML,
-    )
+    await job.finish("\n".join(lines))
 
 
 # ════════════════════════════════════════════════════════════════
@@ -350,7 +399,7 @@ async def copy_entire_pack(client, message: Message, uid: int, source_pack: str)
 async def transfer_pack(client, message: Message, uid: int, recipient_id: int, source_pack: str):
     """
     «Передача» пака: Telegram не даёт сменить owner'а существующего сета, поэтому
-    под капотом это клон — новый custom_emoji-сет создаётся на recipient_id, все
+    под капотом это клон - новый custom_emoji-сет создаётся на recipient_id, все
     эмодзи копируются в него, и только после проверки, что скопировалось всё до
     единого, оригинал удаляется.
     """
@@ -399,14 +448,14 @@ async def transfer_pack(client, message: Message, uid: int, recipient_id: int, s
         else:
             desc = add_res.get("description", "")
             if idx == 0:
-                # Не смогли создать пак получателю вообще — дальше пытаться бессмысленно,
+                # Не смогли создать пак получателю вообще - дальше пытаться бессмысленно,
                 # исходный пак в этом случае не трогаем.
                 await msg.edit_text(
                     T.TRANSFER_FAIL_CREATE.format(desc=h(desc)),
                     parse_mode=enums.ParseMode.HTML,
                 )
                 return
-            errors.append(f"#{idx + 1} — {desc}")
+            errors.append(f"#{idx + 1}: {desc}")
 
         if (idx + 1) % 5 == 0 or (idx + 1) == total:
             bar = progress_bar(idx + 1, total)
@@ -415,7 +464,7 @@ async def transfer_pack(client, message: Message, uid: int, recipient_id: int, s
             except Exception:
                 pass
 
-    # Независимая проверка перед удалением оригинала — не полагаемся только на
+    # Независимая проверка перед удалением оригинала - не полагаемся только на
     # счётчик из цикла: мог быть промежуточный сбой на отдельном элементе.
     check = await tg_api("getStickerSet", data={"name": new_link})
     new_count = len(check.get("result", {}).get("stickers", [])) if check.get("ok") else 0
@@ -432,7 +481,7 @@ async def transfer_pack(client, message: Message, uid: int, recipient_id: int, s
         lines.append(T.TRANSFER_PARTIAL)
         return await msg.edit_text("\n".join(lines), parse_mode=enums.ParseMode.HTML)
 
-    # Всё скопировалось — теперь можно удалять оригинал
+    # Всё скопировалось - теперь можно удалять оригинал
     del_res = await tg_api_retry("deleteStickerSet", data={"name": source_pack})
     db.db_remove_pack(uid, source_pack)
     db.db_add_pack(recipient_id, new_link, title)
@@ -543,3 +592,207 @@ async def set_pack_thumb(client, message: Message, uid: int):
         await msg.edit_text(T.INTERNAL_ERROR.format(desc=h(e)), parse_mode=enums.ParseMode.HTML)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ════════════════════════════════════════════════════════════════
+#  ТЕКСТОВЫЕ ЭМОДЗИ
+# ════════════════════════════════════════════════════════════════
+
+_TEXT_UPLOAD = {
+    "static":   ("image/webp", "text.webp"),
+    "animated": ("application/x-tgsticker", "text.tgs"),
+    "video":    ("video/webm", "text.webm"),
+}
+
+
+async def add_text_emoji(uid: int, link: str, title: str, style, emoji: str) -> dict:
+    """
+    Рисует текстовый эмодзи и кладёт его в пак.
+
+    Формат пака задаётся первым эмодзи и дальше не меняется. Если пак уже существует,
+    эмодзи строится сразу в его формате (со всеми эффектами и анимацией, которые этот
+    формат умеет), а не конвертируется из другого.
+
+    -> {"ok": bool, "err": str, "cid": id кастомного эмодзи, "fmt": static|vector|video, "notes": [...]}
+    """
+    target = await dest_format(link)
+    tmp = f"temp/{uid}_txt_{uuid.uuid4().hex[:6]}"
+    os.makedirs(tmp, exist_ok=True)
+    try:
+        s = style.copy()
+        if target:
+            s.fmt = textemoji.TG_TO_FMT[target]
+        path, tg_fmt, notes = await asyncio.to_thread(textemoji.build, s, tmp)
+        mime, name = _TEXT_UPLOAD[tg_fmt]
+        obj = {"sticker": "attach://f", "format": tg_fmt, "emoji_list": [emoji]}
+        res = await add_to_pack(uid, link, title, obj, path=path, name=name, mime=mime)
+        if not res.get("ok"):
+            return {"ok": False, "err": friendly_error(res.get("description", "")), "cid": None, "fmt": s.fmt, "notes": []}
+        return {"ok": True, "err": "", "cid": await _last_custom_emoji_id(link), "fmt": s.fmt, "notes": notes}
+    except vector.ImageTooComplex:
+        return {"ok": False, "err": T.TXT_TOO_COMPLEX, "cid": None, "fmt": style.fmt, "notes": []}
+    except RuntimeError:
+        return {"ok": False, "err": T.ADAPT_ERRORS["too_heavy"], "cid": None, "fmt": style.fmt, "notes": []}
+    except Exception as e:
+        log.error(f"add_text_emoji: {e}", exc_info=True)
+        return {"ok": False, "err": T.ERR_UNKNOWN, "cid": None, "fmt": style.fmt, "notes": []}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ════════════════════════════════════════════════════════════════
+#  ДОСТАТЬ ИСХОДНИК ЭМОДЗИ
+# ════════════════════════════════════════════════════════════════
+
+async def send_emoji_files(client, message: Message, entities: list):
+    sent = 0
+    for ent in entities[:10]:
+        info = await get_custom_emoji_info(client, ent.custom_emoji_id)
+        if not info:
+            await message.reply(T.NO_EMOJI_INFO)
+            continue
+        tmp = f"temp/{message.from_user.id}_{uuid.uuid4().hex[:6]}"
+        os.makedirs(tmp, exist_ok=True)
+        try:
+            ext = {"static": "webp", "animated": "tgs", "video": "webm"}[info["format"]]
+            path = os.path.join(tmp, f"emoji_{str(ent.custom_emoji_id)[-6:]}.{ext}")
+            if not await download_file(info["file_id"], path):
+                await message.reply(T.ERR_DOWNLOAD)
+                continue
+            await message.reply_document(path, caption=T.FILE_CAPTION.format(fmt=T.FMT_NAMES[info["format"]]),
+                                         parse_mode=enums.ParseMode.HTML)
+            sent += 1
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    return sent
+
+
+# ════════════════════════════════════════════════════════════════
+#  ПЕРЕКРАСКА ПАКА
+# ════════════════════════════════════════════════════════════════
+
+async def resolve_pack_name(client, message: Message) -> tuple[str | None, str | None]:
+    """Имя пака из ссылки, из текста или из присланного эмодзи/стикера. -> (имя, откуда)"""
+    ents = [e for e in (message.entities or []) if e.type == enums.MessageEntityType.CUSTOM_EMOJI]
+    if ents:
+        info = await get_custom_emoji_info(client, ents[0].custom_emoji_id)
+        if info and info.get("set_name"):
+            return info["set_name"], "emoji"
+        return None, "hidden"
+    if message.sticker and message.sticker.set_name:
+        return message.sticker.set_name, "sticker"
+    text = (message.text or "").strip()
+    m = re.search(r"(?:addemoji|addstickers)/([A-Za-z0-9_]+)", text)
+    if m:
+        return m.group(1), "link"
+    if re.fullmatch(r"[A-Za-z0-9_]{3,64}", text):
+        return text, "name"
+    return None, None
+
+
+async def _recolor_one(uid: int, s: dict, idx: int, new_link: str, new_title: str,
+                       hex_color: str, mode: str, st: dict) -> tuple[bool, str, bool]:
+    """Перекрашивает один эмодзи и кладёт его в новый пак. -> (успех, текст ошибки, остановить всё)."""
+    tmp = f"temp/{uid}_rc_{uuid.uuid4().hex[:6]}"
+    os.makedirs(tmp, exist_ok=True)
+    try:
+        raw = os.path.join(tmp, "raw")
+        if not await download_file(s["file_id"], raw):
+            return False, f"#{idx + 1}: {T.ERR_DOWNLOAD}", False
+        kind = await asyncio.to_thread(media.detect_type, raw)
+        try:
+            if kind == "tgs":
+                out, fmt, mime, name = os.path.join(tmp, "o.tgs"), "animated", "application/x-tgsticker", "o.tgs"
+                await asyncio.to_thread(recolor.recolor_tgs_fit, raw, out, hex_color, mode)
+            elif kind in ("webm", "video"):
+                out, fmt, mime, name = os.path.join(tmp, "o.webm"), "video", "video/webm", "o.webm"
+                if not await asyncio.to_thread(recolor.recolor_webm, raw, out, hex_color, mode):
+                    raise media.AdaptError("too_heavy")
+            elif kind == "image":
+                out, fmt, mime, name = os.path.join(tmp, "o.webp"), "static", "image/webp", "o.webp"
+                await asyncio.to_thread(recolor.recolor_image, raw, out, hex_color, mode)
+            else:
+                return False, f"#{idx + 1}: {T.ERR_DOWNLOAD}", False
+        except vector.ImageTooComplex:
+            return False, f"#{idx + 1}: {T.ADAPT_ERRORS['too_complex']}", False
+        except media.AdaptError as e:
+            return False, f"#{idx + 1}: {T.ADAPT_ERRORS.get(e.reason, T.ERR_UNKNOWN)}", False
+        except Exception as e:
+            log.error(f"recolor #{idx}: {e}", exc_info=True)
+            return False, f"#{idx + 1}: {T.ERR_UNKNOWN}", False
+
+        if st["target"] and st["target"] != fmt:
+            return False, f"#{idx + 1}: {T.ERR_FORMAT}", False
+
+        obj = {"sticker": "attach://f", "format": fmt, "emoji_list": [s.get("emoji", "✨")]}
+        r = await add_to_pack(uid, new_link, new_title, obj, path=out, name=name, mime=mime)
+        if r.get("ok"):
+            st["target"] = fmt
+            return True, "", False
+        desc = r.get("description", "")
+        return False, f"#{idx + 1}: {friendly_error(desc)}", _is_full(desc)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def recolor_pack(client, job: "jobs.Job", src_pack: str, hex_color: str, mode: str):
+    """
+    Копия пака в новом цвете. Работает как долгая задача: показывает прогресс и оставшееся время,
+    после каждых BATCH_SIZE добавленных эмодзи делает паузу, отсчитывает ожидания Telegram и
+    останавливается по кнопке (то, что успело перекраситься, остаётся в новом паке).
+    """
+    uid = job.uid
+    res = await tg_api("getStickerSet", data={"name": src_pack})
+    if not res.get("ok"):
+        return await job.finish(T.CLONE_NOT_FOUND)
+    stickers = res["result"].get("stickers", [])[:200]
+    title = res["result"].get("title", src_pack)
+    if not stickers:
+        return await job.finish(T.CLONE_EMPTY)
+
+    total = len(stickers)
+    job.total, job.pacing = total, True
+    job.head = T.RC_HEAD
+    job.extra = T.RC_EXTRA.format(color=hex_color)
+    new_link = f"rc{uuid.uuid4().hex[:10]}{bot_suffix()}"
+    new_title = f"{title[:50]} {hex_color}"[:64]
+    st = {"target": None}
+    errors = []
+    stopped = False
+
+    async with jobs.running(job):
+        await job.update(every=0)
+        for idx, s in enumerate(stickers):
+            if job.cancel:
+                stopped = True
+                break
+            t0, f0 = time.monotonic(), job.flood_time
+            try:
+                ok, err, fatal = await _recolor_one(uid, s, idx, new_link, new_title, hex_color, mode, st)
+            except JobCancelled:
+                stopped = True
+                break
+            job.record((time.monotonic() - t0) - (job.flood_time - f0), ok)
+            if err:
+                errors.append(err)
+            if fatal:
+                break
+            await job.update()
+            if job.needs_pause():
+                try:
+                    await job.pause()
+                except JobCancelled:
+                    stopped = True
+                    break
+
+    if job.added == 0:
+        return await job.finish(T.RC_NONE)
+
+    head = (T.RC_STOPPED if stopped else T.RC_DONE).format(added=job.added, total=total, color=hex_color)
+    lines = [head]
+    if errors:
+        shown = errors[:6]
+        tail = ("\n" + T.CLONE_MORE.format(n=len(errors) - 6)) if len(errors) > 6 else ""
+        lines.append("\n<blockquote expandable>" + T.CLONE_ERRORS + "\n" + "\n".join(shown) + tail + "</blockquote>")
+    lines.append(f"\n{pack_link(new_link)}")
+    await job.finish("\n".join(lines))

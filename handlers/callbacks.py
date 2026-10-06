@@ -9,6 +9,7 @@ import packs
 import states
 import texts as T
 import tg
+from . import textmode
 from tg import app, h, pack_link, tg_api
 
 log = logging.getLogger("fatheremoji")
@@ -112,21 +113,12 @@ async def cb_edit(client, cb: CallbackQuery):
         if not pack_name:
             return await cb.answer(T.PACK_GONE, show_alert=True)
         await cb.answer()
-        header = await _pack_header_data(pack_name)
-        mode = states.vector_prefs.get(target_uid, "off")
-        note = T.VECTOR_FILL_ON_NOTE if mode == "on" else (T.VECTOR_FILL_ASK_NOTE if mode == "ask" else "")
         pack_title = db.db_get_pack_title(target_uid, pack_name) or pack_name
         states.user_states[target_uid].update(
-            {"link": pack_name, "title": pack_title, "state": "WAIT_MEDIA",
-             "default_emoji": "✨", "vector_mode": mode}
+            {"link": pack_name, "title": pack_title, "state": "FILL_MODE", "ctx": "edit",
+             "default_emoji": "✨"}
         )
-        await cb.message.edit_text(
-            T.PACK_FILL_HEADER.format(title=h(pack_title), **header) + note,
-            reply_markup=keyboards.kb_vector_mode(mode),
-            disable_web_page_preview=True,
-            parse_mode=HTML,
-        )
-        await cb.message.reply(T.SESSION_ADD_HINT, reply_markup=keyboards.SESSION_KB)
+        await cb.message.edit_text(T.MODE_ASK, reply_markup=keyboards.kb_fill_mode(), parse_mode=HTML)
 
     elif action == "del_emojis":
         pack_name = states.user_states.get(target_uid, {}).get("edit_link")
@@ -233,6 +225,39 @@ async def cb_edit(client, cb: CallbackQuery):
         await cb.answer()
         await cb.message.edit_text(T.EDIT_CANCELLED, parse_mode=HTML)
         await cb.message.reply(T.MENU_NEXT, reply_markup=keyboards.MAIN_KB)
+
+
+# ── Выбор режима наполнения: обычный или текстовые эмодзи ──
+
+@app.on_callback_query(filters.regex(r"^fill:(normal|text)$"))
+async def cb_fill_mode(client, cb: CallbackQuery):
+    uid = cb.from_user.id
+    data = states.user_states.get(uid, {})
+    if data.get("state") != "FILL_MODE" or not data.get("link"):
+        return await cb.answer(T.ASK_STALE, show_alert=True)
+    await cb.answer()
+
+    if cb.matches[0].group(1) == "text":
+        return await textmode.start(client, cb, uid)
+
+    mode = states.vector_prefs.get(uid, "off")
+    data["vector_mode"] = mode
+    if data.get("ctx") == "create":
+        # Мастер создания: последним шагом выбираем режим векторизации
+        data["state"] = "CREATE_VECTOR"
+        return await cb.message.edit_text(
+            T.VECTOR_ASK, reply_markup=keyboards.kb_vector_mode(mode), parse_mode=HTML)
+
+    header = await _pack_header_data(data["link"])
+    note = T.VECTOR_FILL_ON_NOTE if mode == "on" else (T.VECTOR_FILL_ASK_NOTE if mode == "ask" else "")
+    data["state"] = "WAIT_MEDIA"
+    await cb.message.edit_text(
+        T.PACK_FILL_HEADER.format(title=h(data["title"]), **header) + note,
+        reply_markup=keyboards.kb_vector_mode(mode),
+        disable_web_page_preview=True,
+        parse_mode=HTML,
+    )
+    await cb.message.reply(T.SESSION_ADD_HINT, reply_markup=keyboards.SESSION_KB)
 
 
 # ── Переключалка векторизации ──

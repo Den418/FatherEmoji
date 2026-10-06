@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import html as html_module
 import json
 import logging
@@ -22,6 +23,15 @@ bot_username = ""
 def h(text) -> str:
     """Экранирование пользовательского текста для HTML-parse mode."""
     return html_module.escape(str(text))
+
+
+class JobCancelled(Exception):
+    """Пользователь остановил долгую операцию (кнопка «Остановить»)."""
+
+
+# Если операция хочет показывать пользователю ожидание при flood wait, она кладёт сюда
+# корутину hook(секунды): та сама отсчитывает паузу и обновляет сообщение с прогрессом.
+flood_hook: contextvars.ContextVar = contextvars.ContextVar("flood_hook", default=None)
 
 
 def bot_suffix() -> str:
@@ -70,39 +80,74 @@ async def tg_api(method: str, data: dict = None, files: dict = None) -> dict:
     return await asyncio.to_thread(_req)
 
 
-async def tg_api_retry(method: str, data: dict, max_attempts: int = 4) -> dict:
-    """tg_api без файлов с автоматическим retry при flood-wait (429)."""
+async def tg_api_retry(method: str, data: dict, max_attempts: int = 4, file_spec: tuple | None = None) -> dict:
+    """
+    tg_api с автоматическим retry при flood-wait (429).
+    file_spec = (поле, путь, имя_для_загрузки, mime): файл открывается заново на каждой попытке.
+    """
     res = {}
     for attempt in range(max_attempts):
-        res = await tg_api(method, data=data)
+        files = None
+        if file_spec:
+            field, path, name, mime = file_spec
+            files = {field: (name, open(path, "rb"), mime)}
+        res = await tg_api(method, data=data, files=files)
         if not res.get("ok"):
             desc = res.get("description", "")
             if "retry after" in desc.lower() or res.get("error_code") == 429:
                 retry_after = res.get("parameters", {}).get("retry_after", 5)
                 log.warning(f"Flood wait {retry_after}s на методе {method} (попытка {attempt + 1})")
-                await asyncio.sleep(retry_after + 1)
+                hook = flood_hook.get()
+                if hook:
+                    await hook(retry_after + 1)
+                else:
+                    await asyncio.sleep(retry_after + 1)
                 continue
         return res
     return res
 
 
-async def get_custom_emoji_info(client: Client, custom_emoji_id: str) -> dict | None:
+async def get_custom_emoji_info(client: Client, custom_emoji_id: int | str) -> dict | None:
+    cid = int(custom_emoji_id)      # hydrogram отдаёт id числом, Bot API ждёт строку: приводим сами
     try:
-        stickers = await client.get_custom_emoji_stickers([custom_emoji_id])
+        stickers = await client.get_custom_emoji_stickers([cid])
         if stickers:
             s = stickers[0]
             fmt = "video" if s.is_video else "animated" if s.is_animated else "static"
-            return {"file_id": s.file_id, "format": fmt}
+            return {"file_id": s.file_id, "format": fmt, "set_name": getattr(s, "set_name", None),
+                    "emoji": getattr(s, "emoji", None)}
     except Exception:
         pass
 
-    res = await tg_api("getCustomEmojiStickers", data={"custom_emoji_ids": json.dumps([custom_emoji_id])})
+    res = await tg_api("getCustomEmojiStickers", data={"custom_emoji_ids": json.dumps([str(cid)])})
     if res.get("ok") and res.get("result"):
         s = res["result"][0]
         fmt = "video" if s.get("is_video") else "animated" if s.get("is_animated") else "static"
-        return {"file_id": s["file_id"], "format": fmt}
+        return {"file_id": s["file_id"], "format": fmt, "set_name": s.get("set_name"), "emoji": s.get("emoji")}
 
     return None
+
+
+async def download_file(file_id: str, dst: str) -> bool:
+    """Скачивает файл по file_id через Bot API (формат file_id у hydrogram и Bot API общий)."""
+    info = await tg_api("getFile", data={"file_id": file_id})
+    path = (info.get("result") or {}).get("file_path")
+    if not path:
+        return False
+
+    def _get():
+        try:
+            r = requests.get(f"https://api.telegram.org/file/bot{config.BOT_TOKEN}/{path}", timeout=60)
+            if r.status_code != 200:
+                return False
+            with open(dst, "wb") as f:
+                f.write(r.content)
+            return True
+        except Exception as e:
+            log.error(f"download_file error: {e}")
+            return False
+
+    return await asyncio.to_thread(_get)
 
 
 async def check_subscriptions(client: Client, uid: int) -> tuple[bool, list]:

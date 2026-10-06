@@ -11,9 +11,10 @@ import states
 import texts as T
 import tg
 from tg import app, bot_suffix, get_custom_emoji_info, h, tg_api
+from . import extras, textmode
 from .commands import cmd_help
 
-MENU_ACTIONS = {T.BTN_CREATE, T.BTN_EDIT}
+MENU_ACTIONS = {T.BTN_CREATE, T.BTN_EDIT, T.BTN_EXTRA}
 
 
 @app.on_message(filters.text & filters.private)
@@ -54,11 +55,22 @@ async def handle_text(client, message: Message):
     if text == T.BTN_EDIT:
         return await message.reply(T.ASK_PACK_EDIT, reply_markup=keyboards.kb_user_packs(uid), parse_mode=enums.ParseMode.HTML)
 
+    if text == T.BTN_EXTRA:
+        states.user_states[uid] = {}
+        return await extras.open_menu(message)
+
     if text == T.BTN_CHANNEL:
         return await message.reply(T.CHANNEL.format(url=config.CHANNEL_URL))
 
     if text == T.BTN_HELP:
         return await cmd_help(client, message)
+
+    # ── Текстовые эмодзи и доп. функции ──
+    if state and state.startswith("TXT_"):
+        return await textmode.on_text(client, message, uid, state)
+    if state in ("RC_WAIT_SRC", "RC_WAIT_HEX", "FILE_WAIT"):
+        if await extras.on_message(client, message, uid, state):
+            return
 
     # ── Админские состояния ──
     if state == "ADD_ADMIN" and db.is_admin(uid):
@@ -127,14 +139,8 @@ async def handle_text(client, message: Message):
 
     if state == "PICK_EMOJI":
         # Пак попадёт в БД только после успешной загрузки первого медиа.
-        states.user_states[uid].update({"default_emoji": text, "state": "CREATE_VECTOR"})
-        mode = states.vector_prefs.get(uid, "off")
-        states.user_states[uid]["vector_mode"] = mode
-        return await message.reply(
-            T.VECTOR_ASK,
-            reply_markup=keyboards.kb_vector_mode(mode),
-            parse_mode=enums.ParseMode.HTML,
-        )
+        states.user_states[uid].update({"default_emoji": text, "state": "FILL_MODE", "ctx": "create"})
+        return await message.reply(T.MODE_ASK, reply_markup=keyboards.kb_fill_mode(), parse_mode=enums.ParseMode.HTML)
 
     # Ручной ввод ссылки для паков, созданных раньше
     if state == "MANUAL_EDIT":
@@ -233,7 +239,7 @@ async def handle_text(client, message: Message):
         await message.reply(T.NO_EMOJI_IN_MSG, parse_mode=enums.ParseMode.HTML)
 
     elif state == "WAIT_MEDIA":
-        # Ссылка на чужой пак — копируем целиком
+        # Ссылка на чужой пак - копируем целиком
         if "addemoji/" in text or "addstickers/" in text or "t.me/" in text:
             match = re.search(r"(?:addemoji|addstickers)/([a-zA-Z0-9_]+)", text, re.IGNORECASE)
             pack_name = match.group(1) if match else text.split("/")[-1]
@@ -246,7 +252,7 @@ async def handle_text(client, message: Message):
                 await packs.add_custom_emojis(client, message, uid, ce_list)
                 return
 
-        # Обычный смайлик — реакция для следующего файла
+        # Обычный смайлик - реакция для следующего файла
         states.user_states[uid]["next_emoji"] = text
         await message.reply(T.NEXT_EMOJI_SET.format(emoji=text), parse_mode=enums.ParseMode.HTML)
 
@@ -269,6 +275,10 @@ async def handle_sticker(client, message: Message):
                 T.EMOJI_DEL_ERR.format(desc=h(res.get("description"))),
                 parse_mode=enums.ParseMode.HTML,
             )
+        return
+
+    if state == "RC_WAIT_SRC":
+        await extras.on_message(client, message, uid, state)
         return
 
     if state == "WAIT_MEDIA":

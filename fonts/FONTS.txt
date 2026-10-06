@@ -1,0 +1,6 @@
+Шрифты взяты из Google Fonts и распространяются по лицензии SIL Open Font License 1.1
+(можно использовать и встраивать, в том числе в коммерческих проектах).
+Набор символов урезан до латиницы и кириллицы, вариативные шрифты зафиксированы на нужном начертании.
+
+Montserrat, Fira Sans Condensed, Oswald, Russo One, Unbounded, Comfortaa, Playfair Display,
+Caveat, Amatic SC, Marck Script, Pacifico, Lobster, Press Start 2P.
