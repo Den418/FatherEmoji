@@ -325,6 +325,7 @@ def kb_extra() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(T.IB_X_RECOLOR, callback_data="x:recolor")],
         [InlineKeyboardButton(T.IB_X_FILE,    callback_data="x:file")],
+        [InlineKeyboardButton(T.IB_X_IDS,     callback_data="x:ids")],
         [InlineKeyboardButton(T.IB_X_CLOSE,   callback_data="x:close")],
     ])
 
@@ -348,3 +349,13 @@ def kb_cancel_only() -> InlineKeyboardMarkup:
 
 def kb_job_stop() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(T.IB_JOB_STOP, callback_data="job:stop")]])
+
+
+def kb_pack_mode() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(T.IB_PK_ALL, callback_data="pk:all")],
+        [InlineKeyboardButton(T.IB_PK_ORIG, callback_data="pk:orig"),
+         InlineKeyboardButton(T.IB_PK_PNG, callback_data="pk:png"),
+         InlineKeyboardButton(T.IB_PK_GIF, callback_data="pk:gif")],
+        [InlineKeyboardButton(T.IB_X_CLOSE, callback_data="pk:close")],
+    ])

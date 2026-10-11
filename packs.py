@@ -7,14 +7,18 @@ import time
 import uuid
 
 from hydrogram import enums
-from hydrogram.types import Message
+from hydrogram.errors import FloodWait
+from hydrogram.types import InputMediaDocument, Message
 
 import db
+import emojiid
+import export
 import jobs
 import keyboards
 import media
 import recolor
 import re
+import richtext
 import states
 import textemoji
 import texts as T
@@ -644,47 +648,305 @@ async def add_text_emoji(uid: int, link: str, title: str, style, emoji: str) -> 
 #  ДОСТАТЬ ИСХОДНИК ЭМОДЗИ
 # ════════════════════════════════════════════════════════════════
 
-async def send_emoji_files(client, message: Message, entities: list):
-    sent = 0
+async def _with_flood_retry(make_call, attempts: int = 4):
+    """Отправка с повтором, если Telegram просит подождать (альбомы из многих файлов часто упираются в лимит)."""
+    for i in range(attempts):
+        try:
+            return await make_call()
+        except FloodWait as e:
+            if i == attempts - 1:
+                raise
+            await asyncio.sleep(int(getattr(e, "value", None) or getattr(e, "x", 30)) + 1)
+
+
+async def _send_files(message: Message, files: list, caption: str):
+    """Файлы одним альбомом документов (до 10 штук), подпись у первого."""
+    if len(files) == 1:
+        return await _with_flood_retry(lambda: message.reply_document(files[0], caption=caption, parse_mode=enums.ParseMode.HTML))
+    media_group = [InputMediaDocument(f, caption=caption if i == 0 else None, parse_mode=enums.ParseMode.HTML)
+                   for i, f in enumerate(files)]
+    return await _with_flood_retry(lambda: message.reply_media_group(media_group))
+
+
+async def _export_items(client, message: Message, items: list) -> int:
+    """
+    Ядро скачивания. items: [{"file_id": str | None, "key": str}]; file_id None значит, что файл получить не вышло.
+    На каждый эмодзи уходит альбом файлов во всех форматах (export.py). Один эмодзи: ZIP лежит в том же
+    альбоме. Несколько: после альбомов отдельным сообщением приходит общий ZIP (делится на части).
+    Возвращает, сколько эмодзи удалось обработать.
+    """
+    uid = message.from_user.id
+    items = items[:10]
+    total = len(items)
+    root = f"temp/{uid}_exp_{uuid.uuid4().hex[:6]}"
+    os.makedirs(root, exist_ok=True)
+    status = await message.reply(T.FILE_PREPARING.format(i=0, n=total))
+    groups, done = [], 0
+    try:
+        for i, item in enumerate(items, 1):
+            try:
+                await status.edit_text(T.FILE_PREPARING.format(i=i, n=total))
+            except Exception:
+                pass
+            if not item.get("file_id"):
+                await message.reply(T.FILE_HIDDEN.format(n=i))
+                continue
+
+            work = os.path.join(root, f"e{i}")
+            os.makedirs(work, exist_ok=True)
+            raw = os.path.join(work, "source")
+            if not await download_file(item["file_id"], raw):
+                await message.reply(T.FILE_HIDDEN.format(n=i))
+                continue
+            kind = await asyncio.to_thread(media.detect_type, raw)
+            if kind == "empty":
+                await message.reply(T.FILE_HIDDEN.format(n=i))
+                continue
+
+            base = f"emoji_{item['key']}" + (f"_{i}" if total > 1 else "")
+            try:
+                res = await asyncio.to_thread(export.export_emoji, raw, kind, os.path.join(work, "out"), base)
+            except Exception as e:
+                log.error(f"export #{i}: {e}", exc_info=True)
+                await message.reply(T.FILE_ERROR.format(n=i))
+                continue
+
+            files = list(res.files)
+            if total == 1:
+                zips = await asyncio.to_thread(export.make_zips, [(base, files)], work, f"{base}_all")
+                files += zips[:1]
+            caption = T.FILE_CAPTION.format(n=i, kind=T.FILE_KIND.get(kind, kind), count=len(res.files),
+                                            zip=T.FILE_CAPTION_ZIP if total == 1 else "")
+            if kind != "image":
+                caption += T.FILE_NOTE_ALPHA
+            if res.failed:
+                caption += T.FILE_FAILED.format(items=", ".join(res.failed))
+
+            try:
+                await client.send_chat_action(message.chat.id, enums.ChatAction.UPLOAD_DOCUMENT)
+            except Exception:
+                pass
+            await _send_files(message, files, caption)
+            groups.append((base, res.files))
+            done += 1
+
+        if total > 1 and groups:
+            zips = await asyncio.to_thread(export.make_zips, groups, root, "emoji_all")
+            for n, z in enumerate(zips, 1):
+                part = T.FILE_ZIP_PART.format(i=n, n=len(zips)) if len(zips) > 1 else ""
+                await _with_flood_retry(lambda z=z, part=part: message.reply_document(
+                    z, caption=T.FILE_ZIP_CAPTION.format(part=part), parse_mode=enums.ParseMode.HTML))
+    finally:
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        shutil.rmtree(root, ignore_errors=True)
+
+    if done:
+        await message.reply(T.FILE_DONE_MSG)
+    return done
+
+
+async def send_emoji_files(client, message: Message, entities: list) -> int:
+    """Скачивание премиум-эмодзи из сообщения (до 10)."""
+    items = []
     for ent in entities[:10]:
         info = await get_custom_emoji_info(client, ent.custom_emoji_id)
-        if not info:
-            await message.reply(T.NO_EMOJI_INFO)
-            continue
-        tmp = f"temp/{message.from_user.id}_{uuid.uuid4().hex[:6]}"
-        os.makedirs(tmp, exist_ok=True)
-        try:
-            ext = {"static": "webp", "animated": "tgs", "video": "webm"}[info["format"]]
-            path = os.path.join(tmp, f"emoji_{str(ent.custom_emoji_id)[-6:]}.{ext}")
-            if not await download_file(info["file_id"], path):
-                await message.reply(T.ERR_DOWNLOAD)
-                continue
-            await message.reply_document(path, caption=T.FILE_CAPTION.format(fmt=T.FMT_NAMES[info["format"]]),
-                                         parse_mode=enums.ParseMode.HTML)
-            sent += 1
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-    return sent
+        items.append({"file_id": info["file_id"] if info else None, "key": str(ent.custom_emoji_id)[-6:]})
+    return await _export_items(client, message, items)
+
+
+async def send_sticker_files(client, message: Message) -> int:
+    """Скачивание одного присланного стикера (обычного или из пака эмодзи)."""
+    s = message.sticker
+    key = str(getattr(s, "file_unique_id", "") or "sticker")[-6:]
+    return await _export_items(client, message, [{"file_id": s.file_id, "key": key}])
+
+
+# ════════════════════════════════════════════════════════════════
+#  ЦЕЛЫЙ ПАК В ZIP
+# ════════════════════════════════════════════════════════════════
+
+def _slug(title: str) -> str:
+    s = re.sub(r"[^\w\-]+", "_", title or "", flags=re.UNICODE).strip("_")
+    return s[:40] or "pack"
+
+
+async def pack_info(name: str) -> dict | None:
+    """Краткие сведения о паке для панели выбора режима. None, если пака нет или он пуст."""
+    res = await tg_api("getStickerSet", data={"name": name})
+    if not res.get("ok"):
+        return None
+    r = res["result"]
+    stickers = r.get("stickers", [])
+    if not stickers:
+        return None
+    s = stickers[0]
+    fmt = "video" if s.get("is_video") else "animated" if s.get("is_animated") else "static"
+    return {"name": name, "title": r.get("title", name), "count": len(stickers), "fmt": fmt,
+            "type": r.get("sticker_type", "custom_emoji")}
+
+
+async def _pack_item(s: dict, idx: int, mode: str, root: str, zp: "export.ZipParts") -> tuple[bool, str]:
+    """Скачивает один эмодзи пака, конвертирует и дописывает в архив. -> (успех, текст ошибки)."""
+    work = os.path.join(root, f"w{idx}")
+    os.makedirs(work, exist_ok=True)
+    try:
+        raw = os.path.join(work, "src")
+        if not await download_file(s["file_id"], raw):
+            return False, f"#{idx}: {T.ERR_DOWNLOAD}"
+        kind = await asyncio.to_thread(media.detect_type, raw)
+        if kind == "empty":
+            return False, f"#{idx}: {T.ERR_DOWNLOAD}"
+        base = f"emoji_{idx:03d}"
+        res = await asyncio.to_thread(export.export_emoji, raw, kind, os.path.join(work, "out"), base,
+                                      None if mode == "all" else mode)
+        if not res.files:
+            return False, f"#{idx}: {T.ERR_UNKNOWN}"
+        prefix = f"{idx:03d}/" if mode == "all" else ""       # все форматы: по папке на эмодзи
+        entries = [(prefix + os.path.basename(f), f) for f in res.files]
+        fmt = {"image": "static", "tgs": "animated", "webm": "video", "video": "video"}.get(kind, kind)
+        line = f"{idx:03d}\t{s.get('emoji', '')}\t{s.get('custom_emoji_id') or '-'}\t{fmt}"
+        await asyncio.to_thread(zp.add, entries, line)
+        return True, ""
+    except Exception as e:
+        log.error(f"pack item #{idx}: {e}", exc_info=True)
+        return False, f"#{idx}: {T.ERR_UNKNOWN}"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+async def download_pack_zip(client, job: "jobs.Job", pack_name: str, mode: str):
+    """
+    Скачивает пак целиком в ZIP. mode: all (все форматы) | orig | png | gif.
+    Работает как долгая задача: прогресс, оставшееся время, остановка. Большой архив делится на части
+    по ~45 МБ; то, что успело собраться до остановки, тоже отдаётся.
+    """
+    uid = job.uid
+    res = await tg_api("getStickerSet", data={"name": pack_name})
+    if not res.get("ok"):
+        return await job.finish(T.CLONE_NOT_FOUND)
+    stickers = res["result"].get("stickers", [])
+    title = res["result"].get("title", pack_name)
+    if not stickers:
+        return await job.finish(T.CLONE_EMPTY)
+
+    total = len(stickers)
+    job.total = total
+    job.head = T.PK_HEAD
+    job.extra = T.PK_EXTRA.format(title=h(title), mode=T.PK_MODE_NAMES[mode])
+    root = f"temp/{uid}_pk_{uuid.uuid4().hex[:6]}"
+    os.makedirs(root, exist_ok=True)
+    zp = export.ZipParts(root, f"{_slug(title)}_{mode}")
+    errors, stopped, paths = [], False, []
+    try:
+        async with jobs.running(job):
+            await job.update(every=0)
+            for idx, s in enumerate(stickers, 1):
+                if job.cancel:
+                    stopped = True
+                    break
+                t0 = time.monotonic()
+                try:
+                    ok, err = await _pack_item(s, idx, mode, root, zp)
+                except JobCancelled:
+                    stopped = True
+                    break
+                job.record(time.monotonic() - t0, ok)
+                if err:
+                    errors.append(err)
+                await job.update()
+
+            paths = await asyncio.to_thread(zp.finish)
+            if not paths:
+                return await job.finish(T.PK_NOTHING)
+
+            n = len(paths)
+            for i, path in enumerate(paths, 1):
+                try:
+                    await job.status.edit_text(T.PK_SENDING.format(i=i, n=n), reply_markup=None)
+                except Exception:
+                    pass
+                part = T.PK_PART.format(i=i, n=n) if n > 1 else ""
+                caption = T.PK_ZIP_CAPTION.format(title=h(title), mode=T.PK_MODE_NAMES[mode], part=part,
+                                                  count=zp.parts[i - 1][2])
+                try:
+                    await client.send_chat_action(job.status.chat.id, enums.ChatAction.UPLOAD_DOCUMENT)
+                except Exception:
+                    pass
+                await _with_flood_retry(lambda path=path, caption=caption: job.status.reply_document(
+                    path, caption=caption, parse_mode=enums.ParseMode.HTML))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    lines = [(T.PK_STOPPED if stopped else T.PK_DONE).format(n=len(paths), done=job.added, total=total)]
+    if errors:
+        lines.append(T.PK_FAILED.format(n=len(errors)))
+        shown = errors[:6]
+        tail = ("\n" + T.CLONE_MORE.format(n=len(errors) - 6)) if len(errors) > 6 else ""
+        lines.append("<blockquote expandable>" + T.CLONE_ERRORS + "\n" + "\n".join(shown) + tail + "</blockquote>")
+    await job.finish("\n".join(lines))
+
+
+# ════════════════════════════════════════════════════════════════
+#  ID ЭМОДЗИ ПАКА И СТИКЕРА
+# ════════════════════════════════════════════════════════════════
+
+async def pack_ids(name: str) -> tuple[str, list] | None:
+    """(название пака, [(эмодзи, id)]) для паков эмодзи. None, если пака нет."""
+    res = await tg_api("getStickerSet", data={"name": name})
+    if not res.get("ok"):
+        return None
+    r = res["result"]
+    rows = [(s.get("emoji", ""), s.get("custom_emoji_id") or "") for s in r.get("stickers", [])]
+    return r.get("title", name), [x for x in rows if x[1]]
+
+
+async def sticker_id(sticker) -> tuple[str, str] | None:
+    """(эмодзи, id) для присланного стикера из пака эмодзи: id ищется по паку, сам стикер его не несёт."""
+    name = getattr(sticker, "set_name", None)
+    if not name:
+        return None
+    res = await tg_api("getStickerSet", data={"name": name})
+    if not res.get("ok"):
+        return None
+    for s in res["result"].get("stickers", []):
+        if s.get("file_unique_id") == getattr(sticker, "file_unique_id", None) and s.get("custom_emoji_id"):
+            return s.get("emoji", ""), s["custom_emoji_id"]
+    return None
 
 
 # ════════════════════════════════════════════════════════════════
 #  ПЕРЕКРАСКА ПАКА
 # ════════════════════════════════════════════════════════════════
 
+_PACK_URL = re.compile(r"(?:addemoji|addstickers)(?:/|\?set=)([A-Za-z0-9_]+)")
+
+
 async def resolve_pack_name(client, message: Message) -> tuple[str | None, str | None]:
-    """Имя пака из ссылки, из текста или из присланного эмодзи/стикера. -> (имя, откуда)"""
-    ents = [e for e in (message.entities or []) if e.type == enums.MessageEntityType.CUSTOM_EMOJI]
-    if ents:
-        info = await get_custom_emoji_info(client, ents[0].custom_emoji_id)
+    """
+    Имя пака из присланного эмодзи, стикера, ссылки или названия. Читает и текст, и подпись к медиа,
+    а также ссылки, спрятанные за текстом (так выглядят пересланные посты). -> (имя, откуда)
+    """
+    ce = richtext.custom_emojis(message)
+    if ce:
+        info = await get_custom_emoji_info(client, ce[0][0].custom_emoji_id)
         if info and info.get("set_name"):
             return info["set_name"], "emoji"
         return None, "hidden"
-    if message.sticker and message.sticker.set_name:
-        return message.sticker.set_name, "sticker"
-    text = (message.text or "").strip()
-    m = re.search(r"(?:addemoji|addstickers)/([A-Za-z0-9_]+)", text)
+    sticker = getattr(message, "sticker", None)
+    if sticker and getattr(sticker, "set_name", None):
+        return sticker.set_name, "sticker"
+    text, ents = richtext.body(message)
+    text = text.strip()
+    m = _PACK_URL.search(text)
     if m:
         return m.group(1), "link"
+    for e in ents:                                        # ссылка за текстом: «Скачать пак»
+        m = _PACK_URL.search(getattr(e, "url", None) or "")
+        if m:
+            return m.group(1), "link"
     if re.fullmatch(r"[A-Za-z0-9_]{3,64}", text):
         return text, "name"
     return None, None

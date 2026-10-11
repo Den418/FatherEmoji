@@ -22,7 +22,7 @@ async def start_bot():
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.ERROR)
+    logging.basicConfig(level=logging.INFO)
     init_db()
     log.info("База данных инициализирована.")
     app.run(start_bot())

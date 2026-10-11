@@ -68,7 +68,7 @@ async def handle_text(client, message: Message):
     # ── Текстовые эмодзи и доп. функции ──
     if state and state.startswith("TXT_"):
         return await textmode.on_text(client, message, uid, state)
-    if state in ("RC_WAIT_SRC", "RC_WAIT_HEX", "FILE_WAIT"):
+    if state in extras.STATES:
         if await extras.on_message(client, message, uid, state):
             return
 
@@ -277,7 +277,7 @@ async def handle_sticker(client, message: Message):
             )
         return
 
-    if state == "RC_WAIT_SRC":
+    if state in extras.SOURCE_STATES:
         await extras.on_message(client, message, uid, state)
         return
 
@@ -289,13 +289,18 @@ async def handle_sticker(client, message: Message):
 #  МЕДИА
 # ════════════════════════════════════════════════════════════════
 
-@app.on_message((filters.photo | filters.video | filters.animation | filters.document) & filters.private)
+@app.on_message((filters.photo | filters.video | filters.animation | filters.document | filters.audio | filters.voice) & filters.private)
 async def handle_media(client, message: Message):
     uid = message.from_user.id
     state = states.user_states.get(uid, {}).get("state")
 
     if state == "EDIT_THUMB":
         await packs.set_pack_thumb(client, message, uid)
+        return
+
+    # Пересланный пост с фото или видео: премиум-эмодзи лежат в подписи, читаем её
+    if state in extras.SOURCE_STATES:
+        await extras.on_message(client, message, uid, state)
         return
 
     if state != "WAIT_MEDIA":

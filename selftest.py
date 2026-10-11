@@ -10,7 +10,7 @@ import tempfile
 
 OK, BAD = "✅", "❌"
 failed = []
-OPTIONAL = {"Превью-ролик (libx264)"}
+OPTIONAL = {"Превью-ролик (libx264)", "Названия эмодзи"}
 
 
 def check(name, fn):
@@ -69,6 +69,55 @@ def t_effects():
     return ", ".join(sizes)
 
 
+def t_export():
+    import export
+    import textemoji
+    import media
+    st = textemoji.Style(text="Привет", fmt="vector", anim="pulse", glow=1)
+    src, _, _ = textemoji.build(st, tmp)
+    res = export.export_emoji(src, media.detect_type(src), os.path.join(tmp, "exp"), "e")
+    names = sorted(os.path.splitext(f)[1][1:] for f in map(os.path.basename, res.files))
+    if res.failed:
+        raise RuntimeError(f"не получились форматы: {', '.join(res.failed)}")
+    z = export.make_zips([("e", res.files)], tmp, "e_all")
+    return f"{len(res.files)} файлов ({', '.join(names)}) и ZIP {os.path.getsize(z[0]) // 1024} КБ"
+
+
+def t_pack_zip():
+    import export
+    import textemoji
+    import media
+    st = textemoji.Style(text="Привет", fmt="static")
+    src, _, _ = textemoji.build(st, tmp)
+    zp = export.ZipParts(tmp, "pack_test")
+    for i in (1, 2, 3):
+        res = export.export_emoji(src, media.detect_type(src), os.path.join(tmp, f"pk{i}"), f"emoji_{i:03d}", "png")
+        zp.add([(os.path.basename(f), f) for f in res.files], f"{i:03d}")
+    paths = zp.finish()
+    return f"ZIP из 3 эмодзи: {os.path.getsize(paths[0])} Б"
+
+
+def t_markup():
+    import richtext
+    from hydrogram import enums
+    from hydrogram.types import MessageEntity
+    ents = [MessageEntity(type=enums.MessageEntityType.CUSTOM_EMOJI, offset=0, length=2, custom_emoji_id=5368324170671202286),
+            MessageEntity(type=enums.MessageEntityType.BOLD, offset=3, length=3)]
+    text = "😀 abc"
+    h, m = richtext.to_html(text, ents), richtext.to_markdown(text, ents)
+    assert h == '<tg-emoji emoji-id="5368324170671202286">😀</tg-emoji> <b>abc</b>', h
+    assert m == "![😀](tg://emoji?id=5368324170671202286) *abc*", m
+    return "HTML и MarkdownV2"
+
+
+def t_emoji_names():
+    import emojiid
+    name = emojiid.emoji_name("🔥")
+    if not name:
+        raise RuntimeError("не установлена библиотека emoji: ID работают, но без названий (pip install emoji)")
+    return name
+
+
 def t_preview():
     import textemoji
     st = textemoji.Style(text="Привет", fmt="video", anim="pulse")
@@ -120,7 +169,7 @@ def t_adapt():
 
 
 for title, fn in (("Библиотеки", t_imports), ("ffmpeg с VP9", t_ffmpeg), ("Шрифты", t_fonts),
-                  ("Текстовые эмодзи", t_text), ("Эффекты и анимации (3 формата)", t_effects), ("Превью-ролик (libx264)", t_preview), ("Векторизация (vtracer)", t_vector),
+                  ("Текстовые эмодзи", t_text), ("Эффекты и анимации (3 формата)", t_effects), ("Скачивание эмодзи (все форматы)", t_export), ("ZIP целого пака", t_pack_zip), ("Исходный код разметки", t_markup), ("Названия эмодзи", t_emoji_names), ("Превью-ролик (libx264)", t_preview), ("Векторизация (vtracer)", t_vector),
                   ("Разбор .tgs (rlottie)", t_render), ("Перекраска", t_recolor), ("Конвертация формата", t_adapt)):
     check(title, fn)
 
